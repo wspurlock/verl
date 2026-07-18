@@ -17,7 +17,30 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = ["AlgoConfig", "GAEConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+
+
+@dataclass
+class GAEConfig(BaseConfig):
+    """Configuration for decoupled and length-adaptive GAE."""
+
+    decoupled: bool = False
+    critic_lambda: float = 1.0
+    policy_lambda: float = 0.95
+    length_adaptive: bool = False
+    length_alpha: float = 0.05
+    policy_lambda_min: float = 0.0
+    policy_lambda_max: float = 1.0
+
+    def __post_init__(self):
+        for name in ("critic_lambda", "policy_lambda", "policy_lambda_min", "policy_lambda_max"):
+            value = getattr(self, name)
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"algorithm.gae.{name} must be in [0, 1], got {value}")
+        if self.policy_lambda_min > self.policy_lambda_max:
+            raise ValueError("algorithm.gae.policy_lambda_min must not exceed policy_lambda_max")
+        if self.length_alpha <= 0:
+            raise ValueError(f"algorithm.gae.length_alpha must be positive, got {self.length_alpha}")
 
 
 @dataclass
@@ -650,6 +673,7 @@ class AlgoConfig(BaseConfig):
 
     gamma: float = 1.0
     lam: float = 1.0
+    gae: GAEConfig = field(default_factory=GAEConfig)
     adv_estimator: str = "gae"
     norm_adv_by_std_in_grpo: bool = True
     use_kl_in_reward: bool = False
@@ -667,3 +691,11 @@ class AlgoConfig(BaseConfig):
     # gdpo_reward_weights: per-dimension weights for aggregation (default: equal weights).
     gdpo_reward_keys: Optional[list[str]] = None
     gdpo_reward_weights: Optional[list[float]] = None
+
+    def __post_init__(self):
+        if not 0.0 <= self.gamma <= 1.0:
+            raise ValueError(f"algorithm.gamma must be in [0, 1], got {self.gamma}")
+        if not 0.0 <= self.lam <= 1.0:
+            raise ValueError(f"algorithm.lam must be in [0, 1], got {self.lam}")
+        if (self.gae.decoupled or self.gae.length_adaptive) and self.adv_estimator != "gae":
+            raise ValueError("decoupled or length-adaptive GAE requires algorithm.adv_estimator=gae")

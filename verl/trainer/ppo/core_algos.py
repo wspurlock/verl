@@ -263,6 +263,124 @@ def compute_gae_advantage_return(
     return advantages, returns
 
 
+def compute_gae_raw(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    gamma: float | torch.Tensor,
+    lam: float | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute masked, unnormalized GAE without retaining an autograd graph."""
+    if token_level_rewards.shape != values.shape or values.shape != response_mask.shape:
+        raise ValueError("rewards, values, and response_mask must have identical [batch, time] shapes")
+    if token_level_rewards.ndim != 2:
+        raise ValueError("GAE inputs must have shape [batch, time]")
+
+    with torch.no_grad():
+        mask = response_mask.to(dtype=values.dtype)
+        if (mask.sum(dim=-1) == 0).any():
+            raise ValueError("each sequence must contain at least one valid response token")
+
+        lam_tensor = torch.as_tensor(lam, dtype=values.dtype, device=values.device)
+        if lam_tensor.ndim == 1:
+            if lam_tensor.shape[0] != values.shape[0]:
+                raise ValueError(f"lambda shape must be [{values.shape[0]}], got {tuple(lam_tensor.shape)}")
+        elif lam_tensor.ndim == 0:
+            lam_tensor = lam_tensor.expand(values.shape[0])
+        else:
+            raise ValueError("lambda must be a scalar or a tensor with shape [batch]")
+
+        next_value = torch.zeros_like(values[:, 0])
+        next_advantage = torch.zeros_like(values[:, 0])
+        advantages = torch.zeros_like(values)
+        gamma_tensor = torch.as_tensor(gamma, dtype=values.dtype, device=values.device)
+        for t in reversed(range(values.shape[1])):
+            valid = mask[:, t]
+            delta = token_level_rewards[:, t] + gamma_tensor * next_value - values[:, t]
+            current_advantage = (delta + gamma_tensor * lam_tensor * next_advantage) * valid
+            advantages[:, t] = current_advantage
+            next_value = values[:, t] * valid + next_value * (1 - valid)
+            next_advantage = current_advantage + next_advantage * (1 - valid)
+
+        returns = (advantages + values) * mask
+    return advantages, returns
+
+
+def compute_length_adaptive_lambdas(
+    response_mask: torch.Tensor,
+    *,
+    length_alpha: float = 0.05,
+    policy_lambda_min: float = 0.0,
+    policy_lambda_max: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Return one clamped policy lambda per observed response length."""
+    if length_alpha <= 0:
+        raise ValueError("length_alpha must be positive")
+    if not 0 <= policy_lambda_min <= policy_lambda_max <= 1:
+        raise ValueError("policy lambda bounds must satisfy 0 <= min <= max <= 1")
+    lengths = response_mask.sum(dim=-1)
+    if (lengths == 0).any():
+        raise ValueError("each sequence must contain at least one valid response token")
+    lengths = lengths.to(dtype=torch.float32)
+    raw = 1 - 1 / (length_alpha * lengths)
+    lambdas = raw.clamp(policy_lambda_min, policy_lambda_max).detach()
+    metrics = {
+        "vapo/policy_lambda_mean": lambdas.mean().item(),
+        "vapo/policy_lambda_min": lambdas.min().item(),
+        "vapo/policy_lambda_max": lambdas.max().item(),
+        "vapo/policy_lambda_clamped_low_frac": (raw <= policy_lambda_min).float().mean().item(),
+        "vapo/policy_lambda_clamped_high_frac": (raw >= policy_lambda_max).float().mean().item(),
+    }
+    return lambdas, metrics
+
+
+def compute_decoupled_gae(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    gamma: float,
+    policy_lambda: float | torch.Tensor,
+    critic_lambda: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute whitened actor advantages and independent critic targets."""
+    actor_raw, _ = compute_gae_raw(token_level_rewards, values, response_mask, gamma, policy_lambda)
+    _, critic_returns = compute_gae_raw(token_level_rewards, values, response_mask, gamma, critic_lambda)
+    actor_advantages = verl_F.masked_whiten(actor_raw, response_mask)
+    return actor_advantages, critic_returns, actor_raw
+
+
+def masked_explained_variance(
+    returns: torch.Tensor,
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Explained variance over valid tokens; returns zero for near-constant targets."""
+    with torch.no_grad():
+        valid_returns = returns[mask.bool()].float()
+        valid_values = values[mask.bool()].float()
+        if valid_returns.numel() == 0:
+            raise ValueError("explained variance requires at least one valid token")
+        target_var = valid_returns.var(unbiased=False)
+        if target_var <= eps:
+            return target_var.new_zeros(())
+        residual_var = (valid_returns - valid_values).var(unbiased=False)
+        return 1 - residual_var / target_var
+
+
+def positive_lm_loss(
+    log_prob: torch.Tensor,
+    positive_token_mask: torch.Tensor,
+    global_positive_token_count: int | float | torch.Tensor,
+    dp_size: int = 1,
+) -> torch.Tensor:
+    """Globally normalized response-token NLL for positive trajectories."""
+    if float(global_positive_token_count) == 0:
+        return log_prob.sum() * 0.0
+    denominator = torch.as_tensor(global_positive_token_count, device=log_prob.device, dtype=torch.float32).detach()
+    return -verl_F.masked_sum(log_prob, positive_token_mask.bool()) / denominator * dp_size
+
+
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
 @register_adv_est(AdvantageEstimator.GRPO)  # or simply: @register_adv_est("grpo")
 def compute_grpo_outcome_advantage(

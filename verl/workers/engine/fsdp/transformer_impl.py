@@ -645,6 +645,12 @@ class FSDPEngine(BaseEngine):
             batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
         )
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
+        if "positive_token_mask" in data:
+            positive_token_count = data["positive_token_mask"].sum().to(get_device_id(), dtype=torch.float32)
+            torch.distributed.all_reduce(
+                positive_token_count, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+            )
+            tu.assign_non_tensor(data, positive_token_count=positive_token_count.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
         micro_batches, indices = prepare_micro_batches(

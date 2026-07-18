@@ -139,6 +139,7 @@ def compute_advantage_for_multi_trajectories(
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
     config: Any = None,
+    real_sample_mask: torch.Tensor | None = None,
 ) -> DataProto:
     """Compute GRPO advantages from each session's final output. For non-GRPO
     estimators, such as GAE, are delegated to the original compute_advantage() unchanged.
@@ -149,6 +150,52 @@ def compute_advantage_for_multi_trajectories(
     in ``batch_keys``. Non-GRPO estimators, such as GAE, are delegated to the
     original ``compute_advantage()`` unchanged.
     """
+    gae_config = getattr(config, "gae", None)
+    use_decoupled_gae = (
+        adv_estimator == core_algos.AdvantageEstimator.GAE
+        and gae_config is not None
+        and (gae_config.decoupled or gae_config.length_adaptive)
+    )
+    if use_decoupled_gae:
+        response_mask = data.batch["response_mask"]
+        if real_sample_mask is None:
+            real_sample_mask = response_mask.bool().any(dim=-1)
+        else:
+            real_sample_mask = real_sample_mask.to(device=response_mask.device, dtype=torch.bool)
+        real_response_mask = response_mask[real_sample_mask]
+        if gae_config.length_adaptive:
+            policy_lambdas, lambda_metrics = core_algos.compute_length_adaptive_lambdas(
+                real_response_mask,
+                length_alpha=gae_config.length_alpha,
+                policy_lambda_min=gae_config.policy_lambda_min,
+                policy_lambda_max=gae_config.policy_lambda_max,
+            )
+        else:
+            policy_lambdas = gae_config.policy_lambda
+            lambda_metrics = {
+                "vapo/policy_lambda_mean": policy_lambdas,
+                "vapo/policy_lambda_min": policy_lambdas,
+                "vapo/policy_lambda_max": policy_lambdas,
+                "vapo/policy_lambda_clamped_low_frac": 0.0,
+                "vapo/policy_lambda_clamped_high_frac": 0.0,
+            }
+        real_advantages, real_returns, _ = core_algos.compute_decoupled_gae(
+            data.batch["token_level_rewards"][real_sample_mask],
+            data.batch["values"][real_sample_mask],
+            real_response_mask,
+            gamma=gamma,
+            policy_lambda=policy_lambdas,
+            critic_lambda=gae_config.critic_lambda,
+        )
+        advantages = torch.zeros_like(data.batch["values"])
+        returns = torch.zeros_like(data.batch["values"])
+        advantages[real_sample_mask] = real_advantages
+        returns[real_sample_mask] = real_returns
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+        data.meta_info["vapo_metrics"] = lambda_metrics
+        return data
+
     if adv_estimator != core_algos.AdvantageEstimator.GRPO:
         return compute_advantage(
             data,

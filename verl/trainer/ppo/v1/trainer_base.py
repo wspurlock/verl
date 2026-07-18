@@ -138,6 +138,68 @@ class PPOTrainer(ABC):
         self._rollout_moe_lb_metrics_accumulator = RolloutMoELoadBalanceMetricsAccumulator(
             model_config=self.config.actor_rollout_ref.model
         )
+        value_warmup_steps = self.config.trainer.get("value_warmup_steps", 0)
+        if value_warmup_steps < 0:
+            raise ValueError("trainer.value_warmup_steps must be non-negative")
+        if value_warmup_steps and self.config.trainer.critic_warmup:
+            raise ValueError("trainer.value_warmup_steps and legacy trainer.critic_warmup cannot both be nonzero")
+        gae_config = self.config.algorithm.gae
+        if not 0.0 <= self.config.algorithm.gamma <= 1.0:
+            raise ValueError("algorithm.gamma must be in [0, 1]")
+        if not 0.0 <= self.config.algorithm.lam <= 1.0:
+            raise ValueError("algorithm.lam must be in [0, 1]")
+        for name in ("critic_lambda", "policy_lambda", "policy_lambda_min", "policy_lambda_max"):
+            if not 0.0 <= gae_config[name] <= 1.0:
+                raise ValueError(f"algorithm.gae.{name} must be in [0, 1]")
+        if gae_config.policy_lambda_min > gae_config.policy_lambda_max:
+            raise ValueError("algorithm.gae.policy_lambda_min must not exceed policy_lambda_max")
+        if gae_config.length_alpha <= 0:
+            raise ValueError("algorithm.gae.length_alpha must be positive")
+        if (gae_config.decoupled or gae_config.length_adaptive) and self.config.algorithm.adv_estimator != "gae":
+            raise ValueError("decoupled or length-adaptive GAE requires algorithm.adv_estimator=gae")
+        if value_warmup_steps:
+            if not self.use_critic:
+                raise ValueError("value warmup requires a critic")
+            if self.config.algorithm.adv_estimator != "gae":
+                raise ValueError("value warmup requires algorithm.adv_estimator=gae")
+            if self.trainer_mode != "sync":
+                raise ValueError("value warmup is initially supported only by the v1 synchronous trainer")
+            if gae_config.critic_lambda != 1.0:
+                raise ValueError("value warmup requires algorithm.gae.critic_lambda=1.0")
+        positive_lm_config = self.config.actor_rollout_ref.actor.positive_lm
+        vapo_enabled = (
+            gae_config.decoupled
+            or gae_config.length_adaptive
+            or (positive_lm_config.enabled and positive_lm_config.coef != 0)
+            or value_warmup_steps > 0
+        )
+        self.vapo_enabled = vapo_enabled
+        if (gae_config.decoupled or gae_config.length_adaptive) and self.config.algorithm.lam != 1.0:
+            logger.warning(
+                "algorithm.lam=%s is ignored while decoupled/length-adaptive GAE is enabled; "
+                "use algorithm.gae.policy_lambda and critic_lambda",
+                self.config.algorithm.lam,
+            )
+        if vapo_enabled:
+            if not self.config.trainer.use_v1 or self.trainer_mode != "sync":
+                raise ValueError("VAPO requires trainer.use_v1=true and trainer.v1.trainer_mode=sync")
+            if self.config.actor_rollout_ref.actor.strategy != "fsdp2":
+                raise ValueError("VAPO currently requires the FSDP2 actor/reference training engine")
+            if not self.use_critic or self.config.critic.strategy != "fsdp2":
+                raise ValueError("VAPO currently requires an FSDP2 critic")
+            if self.config.actor_rollout_ref.rollout.name != "vllm":
+                raise ValueError("VAPO currently requires the vLLM rollout backend")
+            if self.config.actor_rollout_ref.rollout.multi_turn.enable:
+                raise ValueError("VAPO currently supports only single-turn trajectories")
+
+    def _value_warmup_active(self) -> bool:
+        """Whether this one-based outer step is a critic-only warmup step."""
+        return self.global_steps <= self.config.trainer.get("value_warmup_steps", 0)
+
+    def _actor_update_enabled(self) -> bool:
+        if self.config.trainer.get("value_warmup_steps", 0):
+            return not self._value_warmup_active()
+        return self.config.trainer.critic_warmup <= self.global_steps
 
     def _build_replay_buffer(self) -> ReplayBuffer:
         """Instantiate the replay buffer (or a user-provided custom sampler).
@@ -507,9 +569,26 @@ class PPOTrainer(ABC):
                 batch = self._update_critic(batch, metrics=metrics)
 
         # 9. update actor
-        if self.config.trainer.critic_warmup <= self.global_steps:
+        warmup_active = self._value_warmup_active()
+        metrics.update(
+            {
+                "trainer/value_warmup_active": float(warmup_active),
+                "trainer/value_warmup_step": self.global_steps if warmup_active else 0,
+                "trainer/value_warmup_remaining": max(
+                    self.config.trainer.get("value_warmup_steps", 0) - self.global_steps + 1, 0
+                )
+                if warmup_active
+                else 0,
+            }
+        )
+        if self._actor_update_enabled():
             with marked_timer("update_actor", timing_raw, color="red"):
                 batch = self._update_actor(batch, metrics=metrics)
+        elif self.config.trainer.get(
+            "save_value_warmup_checkpoint", False
+        ) and self.global_steps == self.config.trainer.get("value_warmup_steps", 0):
+            with marked_timer("save_value_warmup_checkpoint", timing_raw, color="green"):
+                self._save_checkpoint()
 
         return batch
 
@@ -566,6 +645,8 @@ class PPOTrainer(ABC):
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
         self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        if self.vapo_enabled and self.processor is not None and hasattr(self.processor, "image_processor"):
+            raise ValueError("VAPO currently supports text-only models; a multimodal processor was detected")
 
     def _init_dataloader(self):
         """Initialize train and validate dataloader."""
@@ -636,14 +717,16 @@ class PPOTrainer(ABC):
         # The LR scheduler steps once per local update, and each global step performs
         # ``parameter_sync_step`` local updates (see ``PPOTrainer.step``). The optimizer's
         # schedule horizon must therefore count optimizer updates.
-        optim_total_training_steps = total_training_steps * self.parameter_sync_step
+        critic_optim_total_training_steps = total_training_steps * self.parameter_sync_step
+        actor_optim_total_training_steps = max(total_training_steps - self.config.trainer.value_warmup_steps, 0)
+        actor_optim_total_training_steps *= self.parameter_sync_step
         try:
             OmegaConf.set_struct(self.config, True)
             with open_dict(self.config):
                 if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
-                    self.config.actor_rollout_ref.actor.optim.total_training_steps = optim_total_training_steps
+                    self.config.actor_rollout_ref.actor.optim.total_training_steps = actor_optim_total_training_steps
                 if OmegaConf.select(self.config, "critic.optim"):
-                    self.config.critic.optim.total_training_steps = optim_total_training_steps
+                    self.config.critic.optim.total_training_steps = critic_optim_total_training_steps
         except Exception as e:
             logger.warning(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
@@ -1359,7 +1442,7 @@ class PPOTrainer(ABC):
             required_multiple = math.lcm(required_multiple, critic_global_mini_batch_size)
 
         # If there is an actor update, the batch should align with actor PPO mini-batches too.
-        if self.config.trainer.critic_warmup <= self.global_steps:
+        if self._actor_update_enabled():
             actor_global_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
             actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
             required_multiple = math.lcm(required_multiple, actor_global_mini_batch_size)
@@ -1505,12 +1588,49 @@ class PPOTrainer(ABC):
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        positive_lm_config = self.config.actor_rollout_ref.actor.positive_lm
+        use_positive_lm = positive_lm_config.enabled and positive_lm_config.coef != 0
+        if use_positive_lm and positive_lm_config.correctness_key not in fields:
+            fields.append(positive_lm_config.correctness_key)
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         response_mask = data["response_mask"]
+        correctness_values = None
+        if use_positive_lm and positive_lm_config.correctness_key != "rm_scores":
+            correctness_values = list(data[positive_lm_config.correctness_key])
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
+        positive_rows = None
+        if use_positive_lm:
+            key = positive_lm_config.correctness_key
+            if key == "rm_scores":
+                # ``rm_scores`` is the raw verifier output, before KL-in-reward or any other
+                # reward shaping. Reward managers store the trajectory score on the final
+                # valid response token.
+                lengths = data.batch["response_mask"].sum(dim=-1).long()
+                safe_indices = (lengths - 1).clamp_min(0).unsqueeze(-1)
+                correctness_values = data.batch["rm_scores"].gather(-1, safe_indices).squeeze(-1).tolist()
+
+            positive_rows = []
+            for index, (value, tag) in enumerate(zip(correctness_values, batch.tags, strict=True)):
+                if tag.get("is_padding", False):
+                    positive_rows.append(False)
+                    continue
+                if isinstance(value, bool):
+                    numeric_value = float(value)
+                elif isinstance(value, int | float | np.number) and not isinstance(value, complex):
+                    numeric_value = float(value)
+                else:
+                    raise ValueError(
+                        f"positive LM correctness field {key!r} must be a numeric scalar; "
+                        f"sample {index} has {type(value).__name__}"
+                    )
+                if not math.isfinite(numeric_value):
+                    raise ValueError(
+                        f"positive LM correctness field {key!r} must be finite; sample {index} has {value!r}"
+                    )
+                positive_rows.append(numeric_value >= positive_lm_config.correctness_threshold)
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:
@@ -1543,7 +1663,33 @@ class PPOTrainer(ABC):
             num_repeat=self.config.actor_rollout_ref.rollout.n,
             norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
             config=self.config.algorithm,
+            real_sample_mask=torch.tensor(
+                [not tag.get("is_padding", False) for tag in batch.tags],
+                device=data.batch["response_mask"].device,
+            ),
         )
+        metrics.update(data.meta_info.get("vapo_metrics", {}))
+        if data.meta_info.get("vapo_metrics"):
+            valid_advantages = data.batch["advantages"][data.batch["response_mask"].bool()]
+            valid_returns = data.batch["returns"][data.batch["response_mask"].bool()]
+            metrics.update(
+                {
+                    "vapo/actor_advantage_mean": valid_advantages.mean().item(),
+                    "vapo/actor_advantage_std": valid_advantages.std(unbiased=False).item(),
+                    "vapo/critic_return_mean": valid_returns.mean().item(),
+                    "vapo/critic_return_std": valid_returns.std(unbiased=False).item(),
+                }
+            )
+        if self.use_critic:
+            real_rows = torch.tensor(
+                [not tag.get("is_padding", False) for tag in batch.tags],
+                device=data.batch["response_mask"].device,
+                dtype=torch.bool,
+            )
+            explained_variance_mask = data.batch["response_mask"].bool() & real_rows.unsqueeze(-1)
+            metrics["critic/explained_variance"] = core_algos.masked_explained_variance(
+                data.batch["returns"], data.batch["values"], explained_variance_mask
+            ).item()
 
         # 4. write nested advantages and returns back to TransferQueue
         fields = ["advantages", "returns"]
@@ -1556,7 +1702,38 @@ class PPOTrainer(ABC):
 
         output = {}
         for field in fields:
-            output[field] = response_to_nested(data.batch[field], response_mask)
+            if field in data.batch:
+                output[field] = response_to_nested(data.batch[field], response_mask)
+        if use_positive_lm:
+            positive_rows_tensor = torch.tensor(positive_rows, device=response_mask.device, dtype=torch.bool)
+            positive_token_mask = positive_rows_tensor.unsqueeze(-1) & data.batch["response_mask"].bool()
+            output["positive_token_mask"] = response_to_nested(positive_token_mask, response_mask)
+            real_rows = torch.tensor(
+                [not tag.get("is_padding", False) for tag in batch.tags],
+                device=response_mask.device,
+                dtype=torch.bool,
+            )
+            real_response_mask = data.batch["response_mask"].bool() & real_rows.unsqueeze(-1)
+            positive_lengths = positive_token_mask.sum(dim=-1)
+            positive_sequence_count = (positive_rows_tensor & real_rows).sum()
+            positive_token_count = positive_token_mask.sum()
+            real_sequence_count = real_rows.sum()
+            real_token_count = real_response_mask.sum()
+            metrics.update(
+                {
+                    "actor/positive_sequence_count": positive_sequence_count.item(),
+                    "actor/positive_sequence_fraction": (
+                        positive_sequence_count.float() / real_sequence_count.clamp_min(1)
+                    ).item(),
+                    "actor/positive_token_count": positive_token_count.item(),
+                    "actor/positive_token_fraction": (
+                        positive_token_count.float() / real_token_count.clamp_min(1)
+                    ).item(),
+                    "actor/positive_mean_response_length": (
+                        positive_lengths.sum().float() / positive_sequence_count.clamp_min(1)
+                    ).item(),
+                }
+            )
         output = TensorDict(output, batch_size=len(batch))
 
         batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)

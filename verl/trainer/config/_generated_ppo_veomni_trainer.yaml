@@ -84,6 +84,12 @@ actor_rollout_ref:
       ppo_kl_coef: 0.1
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
+    positive_lm:
+      _target_: verl.workers.config.PositiveLMConfig
+      enabled: false
+      coef: 0.1
+      correctness_key: acc
+      correctness_threshold: 1.0
     loss_scale_factor: null
     entropy_coeff: 0
     calculate_entropy: false
@@ -774,6 +780,15 @@ algorithm:
   _target_: verl.trainer.config.AlgoConfig
   gamma: 1.0
   lam: 1.0
+  gae:
+    _target_: verl.trainer.config.GAEConfig
+    decoupled: false
+    critic_lambda: 1.0
+    policy_lambda: 0.95
+    length_adaptive: false
+    length_alpha: 0.05
+    policy_lambda_min: 0.0
+    policy_lambda_max: 1.0
   adv_estimator: gae
   norm_adv_by_std_in_grpo: true
   use_kl_in_reward: false
@@ -859,6 +874,8 @@ trainer:
   val_only: false
   test_freq: -1
   critic_warmup: 0
+  value_warmup_steps: 0
+  save_value_warmup_checkpoint: false
   default_hdfs_dir: null
   del_local_ckpt_after_load: false
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}

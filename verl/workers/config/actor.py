@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -43,7 +44,26 @@ __all__ = [
     "QATConfig",
     "TorchTitanActorConfig",
     "MindSpeedActorConfig",
+    "PositiveLMConfig",
 ]
+
+
+@dataclass
+class PositiveLMConfig(BaseConfig):
+    """Auxiliary language-model loss on verifier-confirmed positive responses."""
+
+    enabled: bool = False
+    coef: float = 0.1
+    correctness_key: str = "acc"
+    correctness_threshold: float = 1.0
+
+    def __post_init__(self):
+        if self.coef < 0:
+            raise ValueError(f"positive_lm.coef must be non-negative, got {self.coef}")
+        if self.enabled and not self.correctness_key:
+            raise ValueError("positive_lm.correctness_key must be non-empty when enabled")
+        if not math.isfinite(self.correctness_threshold):
+            raise ValueError("positive_lm.correctness_threshold must be finite")
 
 
 @dataclass
@@ -162,6 +182,7 @@ class ActorConfig(BaseConfig):
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
+    positive_lm: PositiveLMConfig = field(default_factory=PositiveLMConfig)
     loss_scale_factor: Optional[int] = None
     entropy_coeff: float = 0
     tau_pos: float = 1.0

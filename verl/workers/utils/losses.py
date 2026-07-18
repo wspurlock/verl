@@ -16,7 +16,13 @@
 import torch
 from tensordict import TensorDict
 
-from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    compute_value_loss,
+    get_policy_loss_fn,
+    kl_penalty,
+    positive_lm_loss,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.metric import AggregationType, Metric
@@ -66,6 +72,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
     config.global_batch_info["global_batch_size"] = data["global_batch_size"]
     config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+    positive_token_count = tu.get_non_tensor_data(data, "positive_token_count", default=None)
+    dp_size = data["dp_size"]
 
     # assumes that if any of the global batch info is set, the policy_loss_fn will
     # normalize using dp_size/global_bsz/global_token; in this case, metric aggregation should be SUM
@@ -84,6 +92,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     # select fields and convert to padded tensor
     fields = ["response_mask", "old_log_probs", "advantages"]
+    if config.positive_lm.enabled and config.positive_lm.coef != 0:
+        fields.append("positive_token_mask")
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
@@ -118,6 +128,23 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     metrics.update(pg_metrics)
     metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
     policy_loss = pg_loss
+
+    if config.positive_lm.enabled and config.positive_lm.coef != 0:
+        positive_mask = data["positive_token_mask"].to(bool) & response_mask
+        if positive_token_count is None:
+            positive_token_count = positive_mask.sum()
+        positive_loss = positive_lm_loss(log_prob, positive_mask, positive_token_count, dp_size)
+        weighted_positive_lm_loss = config.positive_lm.coef * positive_loss
+        policy_loss += weighted_positive_lm_loss
+        metrics.update(
+            {
+                "actor/positive_lm_loss": Metric(value=positive_loss, aggregation=metric_aggregation),
+                "actor/positive_lm_weighted_loss": Metric(
+                    value=weighted_positive_lm_loss, aggregation=metric_aggregation
+                ),
+                "actor/positive_lm_coef": config.positive_lm.coef,
+            }
+        )
 
     # add entropy loss
     if entropy is not None:
