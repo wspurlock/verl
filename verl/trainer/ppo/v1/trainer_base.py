@@ -103,6 +103,30 @@ def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+_VAPO_CHECKPOINT_METADATA = "vapo_metadata.json"
+_VAPO_RESUME_CONFIG_PATHS = (
+    "trainer.value_warmup_steps",
+    "algorithm.adv_estimator",
+    "algorithm.gamma",
+    "algorithm.use_kl_in_reward",
+    "algorithm.gae.decoupled",
+    "algorithm.gae.critic_lambda",
+    "algorithm.gae.policy_lambda",
+    "algorithm.gae.length_adaptive",
+    "algorithm.gae.length_alpha",
+    "algorithm.gae.policy_lambda_min",
+    "algorithm.gae.policy_lambda_max",
+    "actor_rollout_ref.actor.clip_ratio_low",
+    "actor_rollout_ref.actor.clip_ratio_high",
+    "actor_rollout_ref.actor.loss_agg_mode",
+    "actor_rollout_ref.actor.use_kl_loss",
+    "actor_rollout_ref.actor.positive_lm.enabled",
+    "actor_rollout_ref.actor.positive_lm.coef",
+    "actor_rollout_ref.actor.positive_lm.correctness_key",
+    "actor_rollout_ref.actor.positive_lm.correctness_threshold",
+    "actor_rollout_ref.rollout.n",
+)
+
 
 def _tq_supports_checkpoint() -> bool:
     """Whether the installed TransferQueue can snapshot/restore its state for checkpoint consistency."""
@@ -115,6 +139,39 @@ def _tq_supports_checkpoint() -> bool:
         and callable(getattr(tq, "save_checkpoint", None))
         and callable(getattr(tq, "load_checkpoint", None))
     )
+
+
+def _optimizer_training_steps(
+    total_training_steps: int,
+    parameter_sync_step: int,
+    value_warmup_steps: int,
+) -> tuple[int, int]:
+    """Return actor and critic optimizer-update horizons.
+
+    The critic updates during value warmup; the actor does not.
+    """
+    critic_steps = total_training_steps * parameter_sync_step
+    actor_steps = max(total_training_steps - value_warmup_steps, 0) * parameter_sync_step
+    return actor_steps, critic_steps
+
+
+def _vapo_resume_settings(config: DictConfig) -> dict[str, Any]:
+    """Return resolved settings that must remain stable across a full VAPO resume."""
+    return {path: OmegaConf.select(config, path) for path in _VAPO_RESUME_CONFIG_PATHS}
+
+
+def _validate_vapo_resume_settings(saved: dict[str, Any], current: dict[str, Any]) -> None:
+    """Reject a full-run resume whose VAPO semantics differ from the checkpoint."""
+    mismatches = {
+        path: (saved.get(path), current.get(path))
+        for path in _VAPO_RESUME_CONFIG_PATHS
+        if saved.get(path) != current.get(path)
+    }
+    if mismatches:
+        details = ", ".join(
+            f"{path}: checkpoint={old!r}, current={new!r}" for path, (old, new) in mismatches.items()
+        )
+        raise ValueError(f"VAPO checkpoint configuration mismatch: {details}")
 
 
 class PPOTrainer(ABC):
@@ -200,6 +257,12 @@ class PPOTrainer(ABC):
         if self.config.trainer.get("value_warmup_steps", 0):
             return not self._value_warmup_active()
         return self.config.trainer.critic_warmup <= self.global_steps
+
+    def _should_save_value_warmup_checkpoint(self) -> bool:
+        """Whether the completed outer step is the configured warmup boundary."""
+        return self.config.trainer.get(
+            "save_value_warmup_checkpoint", False
+        ) and self.global_steps == self.config.trainer.get("value_warmup_steps", 0)
 
     def _build_replay_buffer(self) -> ReplayBuffer:
         """Instantiate the replay buffer (or a user-provided custom sampler).
@@ -520,6 +583,12 @@ class PPOTrainer(ABC):
             combined_tags.extend(batch.tags)
             combined_partition_id = batch.partition_id
 
+        # The warmup checkpoint represents a completed outer iteration. Saving in
+        # ``_step_once`` would expose partial state when ``parameter_sync_step > 1``.
+        if self._should_save_value_warmup_checkpoint():
+            with marked_timer("save_value_warmup_checkpoint", timing_raw, color="green"):
+                self._save_checkpoint()
+
         metrics.update(metrics_aggregator.get_aggregated_metrics())
         return KVBatchMeta(partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags)
 
@@ -584,11 +653,6 @@ class PPOTrainer(ABC):
         if self._actor_update_enabled():
             with marked_timer("update_actor", timing_raw, color="red"):
                 batch = self._update_actor(batch, metrics=metrics)
-        elif self.config.trainer.get(
-            "save_value_warmup_checkpoint", False
-        ) and self.global_steps == self.config.trainer.get("value_warmup_steps", 0):
-            with marked_timer("save_value_warmup_checkpoint", timing_raw, color="green"):
-                self._save_checkpoint()
 
         return batch
 
@@ -717,9 +781,11 @@ class PPOTrainer(ABC):
         # The LR scheduler steps once per local update, and each global step performs
         # ``parameter_sync_step`` local updates (see ``PPOTrainer.step``). The optimizer's
         # schedule horizon must therefore count optimizer updates.
-        critic_optim_total_training_steps = total_training_steps * self.parameter_sync_step
-        actor_optim_total_training_steps = max(total_training_steps - self.config.trainer.value_warmup_steps, 0)
-        actor_optim_total_training_steps *= self.parameter_sync_step
+        actor_optim_total_training_steps, critic_optim_total_training_steps = _optimizer_training_steps(
+            total_training_steps,
+            self.parameter_sync_step,
+            self.config.trainer.value_warmup_steps,
+        )
         try:
             OmegaConf.set_struct(self.config, True)
             with open_dict(self.config):
@@ -810,6 +876,17 @@ class PPOTrainer(ABC):
                 global_step_folder = os.path.join(working_dir, global_step_folder)
         else:
             logger.exception(f"Unknown resume mode {self.config.trainer.resume_mode}")
+
+        vapo_metadata_path = os.path.join(global_step_folder, _VAPO_CHECKPOINT_METADATA)
+        if os.path.exists(vapo_metadata_path):
+            with open(vapo_metadata_path) as f:
+                metadata = json.load(f)
+            _validate_vapo_resume_settings(metadata["settings"], _vapo_resume_settings(self.config))
+        elif self.vapo_enabled:
+            raise ValueError(
+                f"VAPO checkpoint {global_step_folder} has no {_VAPO_CHECKPOINT_METADATA}; "
+                "refusing an unverifiable full-run resume"
+            )
 
         # set global step
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
@@ -934,6 +1011,19 @@ class PPOTrainer(ABC):
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
+
+        if self.vapo_enabled:
+            metadata = {
+                "schema_version": 1,
+                "global_step": self.global_steps,
+                "settings": _vapo_resume_settings(self.config),
+            }
+            metadata_path = os.path.join(local_global_step_folder, _VAPO_CHECKPOINT_METADATA)
+            temporary_metadata_path = f"{metadata_path}.tmp"
+            with open(temporary_metadata_path, "w") as f:
+                json.dump(metadata, f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.replace(temporary_metadata_path, metadata_path)
 
         # save TransferQueue state for async modes so in-flight prompts (already fetched from the
         # dataloader but not yet trained into this checkpoint's weights) survive a restart:
@@ -1670,15 +1760,18 @@ class PPOTrainer(ABC):
         )
         metrics.update(data.meta_info.get("vapo_metrics", {}))
         if data.meta_info.get("vapo_metrics"):
-            valid_advantages = data.batch["advantages"][data.batch["response_mask"].bool()]
-            valid_returns = data.batch["returns"][data.batch["response_mask"].bool()]
+            real_rows = torch.tensor(
+                [not tag.get("is_padding", False) for tag in batch.tags],
+                device=data.batch["response_mask"].device,
+                dtype=torch.bool,
+            )
             metrics.update(
-                {
-                    "vapo/actor_advantage_mean": valid_advantages.mean().item(),
-                    "vapo/actor_advantage_std": valid_advantages.std(unbiased=False).item(),
-                    "vapo/critic_return_mean": valid_returns.mean().item(),
-                    "vapo/critic_return_std": valid_returns.std(unbiased=False).item(),
-                }
+                core_algos.compute_vapo_data_metrics(
+                    data.batch["advantages"],
+                    data.batch["returns"],
+                    data.batch["response_mask"],
+                    real_rows,
+                )
             )
         if self.use_critic:
             real_rows = torch.tensor(

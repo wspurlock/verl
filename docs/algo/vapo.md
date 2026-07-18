@@ -40,8 +40,25 @@ verifier output rather than a KL-shaped reward.
 - `trainer.value_warmup_steps` counts outer rollout/update iterations. During
   these iterations the critic updates and the actor optimizer does not step.
 - `trainer.save_value_warmup_checkpoint` saves a normal resumable checkpoint
-  after the final warmup critic update. Resume it to continue the same run, or
-  initialize a new run's critic from it with `value_warmup_steps=0`.
+  after the final warmup critic update. It is a full-run checkpoint containing
+  actor, critic, optimizer, scheduler, dataloader, and step state; it is not a
+  critic-only initialization artifact.
+
+The VAPO recipe starts fresh by default (`trainer.resume_mode=disable`) and uses
+an experiment-specific output directory. To resume the exact same run, provide
+the full checkpoint explicitly:
+
+```bash
+RESUME_FROM_PATH=/path/to/global_step_50 \
+    bash examples/vapo_trainer/run_qwen3_8b_fsdp2.sh
+```
+
+VAPO checkpoints record the resolved warmup and algorithm settings. Full-run
+resume fails if those settings differ, so changing `value_warmup_steps` or an
+objective setting requires a new experiment. The current implementation does
+not import the critic alone from an FSDP trainer checkpoint. Producing a
+portable calibrated-critic initialization would require a separate, explicit
+export/import workflow.
 
 Run the small canonical recipe with:
 

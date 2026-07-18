@@ -11,6 +11,7 @@ from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
     compute_gae_raw,
     compute_length_adaptive_lambdas,
+    compute_vapo_data_metrics,
     masked_explained_variance,
     positive_lm_loss,
 )
@@ -91,6 +92,20 @@ def test_masked_explained_variance_and_constant_convention():
     assert masked_explained_variance(torch.ones_like(returns), values, mask).item() == 0.0
 
 
+def test_vapo_data_metrics_exclude_balancing_padding():
+    advantages = torch.tensor([[1.0, 3.0], [0.0, 0.0]])
+    returns = torch.tensor([[2.0, 6.0], [0.0, 0.0]])
+    response_mask = torch.ones_like(advantages)
+    real_sample_mask = torch.tensor([True, False])
+
+    metrics = compute_vapo_data_metrics(advantages, returns, response_mask, real_sample_mask)
+
+    assert metrics["vapo/actor_advantage_mean"] == pytest.approx(2.0)
+    assert metrics["vapo/actor_advantage_std"] == pytest.approx(1.0)
+    assert metrics["vapo/critic_return_mean"] == pytest.approx(4.0)
+    assert metrics["vapo/critic_return_std"] == pytest.approx(2.0)
+
+
 def test_positive_lm_loss_formula_and_masking():
     log_prob = torch.tensor([[-1.0, -2.0, -30.0], [-4.0, -5.0, -60.0]], requires_grad=True)
     positive_mask = torch.tensor([[1, 1, 0], [0, 0, 0]])
@@ -110,3 +125,30 @@ def test_positive_lm_loss_empty_is_differentiable_zero():
     assert loss.item() == 0.0
     loss.backward()
     torch.testing.assert_close(log_prob.grad, torch.zeros_like(log_prob))
+
+
+def test_positive_lm_loss_matches_single_rank_when_partitioned():
+    full_log_prob = torch.tensor([-1.0, -2.0, -3.0, -4.0], requires_grad=True)
+    full_mask = torch.tensor([1, 0, 1, 1])
+    full_loss = positive_lm_loss(full_log_prob, full_mask, global_positive_token_count=3)
+    full_loss.backward()
+
+    rank_log_probs = [
+        torch.tensor([-1.0, -2.0], requires_grad=True),
+        torch.tensor([-3.0, -4.0], requires_grad=True),
+    ]
+    rank_masks = [torch.tensor([1, 0]), torch.tensor([1, 1])]
+    rank_losses = [
+        positive_lm_loss(log_prob, mask, global_positive_token_count=3, dp_size=2)
+        for log_prob, mask in zip(rank_log_probs, rank_masks, strict=True)
+    ]
+    # DDP averages rank gradients, so average the independently computed rank
+    # losses to model its reduction.
+    distributed_loss = sum(rank_losses) / 2
+    distributed_loss.backward()
+
+    assert distributed_loss.item() == pytest.approx(full_loss.item())
+    torch.testing.assert_close(
+        torch.cat([log_prob.grad for log_prob in rank_log_probs]),
+        full_log_prob.grad,
+    )

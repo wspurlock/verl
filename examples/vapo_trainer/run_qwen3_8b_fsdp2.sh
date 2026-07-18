@@ -14,7 +14,17 @@ PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-16}
 ROLLOUT_N=${ROLLOUT_N:-16}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-2048}
-OUTPUT_DIR=${OUTPUT_DIR:-checkpoints/vapo}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-vapo}
+OUTPUT_DIR=${OUTPUT_DIR:-checkpoints/vapo/$EXPERIMENT_NAME}
+RESUME_FROM_PATH=${RESUME_FROM_PATH:-}
+
+RESUME_ARGS=(trainer.resume_mode=disable)
+if [[ -n "$RESUME_FROM_PATH" ]]; then
+    RESUME_ARGS=(
+        trainer.resume_mode=resume_path
+        trainer.resume_from_path="$RESUME_FROM_PATH"
+    )
+fi
 
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=true \
@@ -41,6 +51,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_mini_batch_size="$PPO_MINI_BATCH_SIZE" \
     actor_rollout_ref.actor.use_dynamic_bsz=true \
     actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.lr_scheduler_type=constant \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.n="$ROLLOUT_N" \
     critic.model.path="$CRITIC_MODEL_PATH" \
@@ -48,12 +59,15 @@ python3 -m verl.trainer.main_ppo \
     critic.ppo_mini_batch_size="$PPO_MINI_BATCH_SIZE" \
     critic.use_dynamic_bsz=true \
     critic.optim.lr=2e-6 \
+    critic.optim.lr_scheduler_type=constant \
     data.train_files="$TRAIN_FILE" \
     data.val_files="$VAL_FILE" \
     data.train_batch_size="$TRAIN_BATCH_SIZE" \
     data.max_prompt_length="$MAX_PROMPT_LENGTH" \
     data.max_response_length="$MAX_RESPONSE_LENGTH" \
     trainer.value_warmup_steps=50 \
+    trainer.experiment_name="$EXPERIMENT_NAME" \
     trainer.n_gpus_per_node="$N_GPUS" \
     trainer.default_local_dir="$OUTPUT_DIR" \
-    "$@"
+    "$@" \
+    "${RESUME_ARGS[@]}"

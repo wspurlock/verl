@@ -368,6 +368,32 @@ def masked_explained_variance(
         return 1 - residual_var / target_var
 
 
+def compute_vapo_data_metrics(
+    advantages: torch.Tensor,
+    returns: torch.Tensor,
+    response_mask: torch.Tensor,
+    real_sample_mask: torch.Tensor,
+) -> dict[str, float]:
+    """Summarize VAPO targets over real response tokens only."""
+    if advantages.shape != returns.shape or returns.shape != response_mask.shape:
+        raise ValueError("advantages, returns, and response_mask must have identical shapes")
+    if real_sample_mask.shape != (advantages.shape[0],):
+        raise ValueError(f"real_sample_mask must have shape [{advantages.shape[0]}]")
+    valid_mask = response_mask.bool() & real_sample_mask.to(
+        device=response_mask.device, dtype=torch.bool
+    ).unsqueeze(-1)
+    if not valid_mask.any():
+        raise ValueError("VAPO metrics require at least one real response token")
+    valid_advantages = advantages[valid_mask].float()
+    valid_returns = returns[valid_mask].float()
+    return {
+        "vapo/actor_advantage_mean": valid_advantages.mean().item(),
+        "vapo/actor_advantage_std": valid_advantages.std(unbiased=False).item(),
+        "vapo/critic_return_mean": valid_returns.mean().item(),
+        "vapo/critic_return_std": valid_returns.std(unbiased=False).item(),
+    }
+
+
 def positive_lm_loss(
     log_prob: torch.Tensor,
     positive_token_mask: torch.Tensor,
