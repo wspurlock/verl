@@ -65,6 +65,21 @@ uv pip install \
     "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"
 uv pip install --no-deps -e .
 
+# Reassert the Numba-compatible NumPy version after all dependency resolution.
+# Keep this final: later installs may otherwise upgrade NumPy transitively.
+uv pip install "numpy==2.2.6"
+
+python3 - <<'PY'
+import numba
+import numpy
+import scipy
+import vllm
+
+assert numpy.__version__ == "2.2.6", numpy.__version__
+print(f"Verified runtime versions: NumPy {numpy.__version__}, Numba {numba.__version__}, "
+      f"SciPy {scipy.__version__}, vLLM {vllm.__version__}")
+PY
+
 python3 examples/data_preprocess/gsm8k.py \
     --local_save_dir "$VAPO_HOME/data/gsm8k"
 
